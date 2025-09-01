@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Python-Web Demo</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h2>Live Counters</h2>
+        <div class="counters">
+            <p>Counter 1: <span id="counter1">0</span></p>
+            <p>Counter 2: <span id="counter2">0</span></p>
+            <p>Counter 3: <span id="counter3">0</span></p>
+            <p>Counter 4: <span id="counter4">0</span></p>
+            <p>Counter 5: <span id="counter5">0</span></p>
+            <p>Counter 6: <span id="counter6">0</span></p>
+        </div>
+        <button id="clickButton">Click Me</button>
+    </div>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
