@@ -1,10 +1,7 @@
 import time
 
 def rs485_task(socketio):
-    """
-    Example RS485 thread.
-    Replace the loop with your real RS485 read/write logic.
-    """
+
     while True:
         print("RS485 thread is running...")
 
