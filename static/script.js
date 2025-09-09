@@ -13,8 +13,12 @@ socket.on('rs485_update', function(data) {
 });
 
 // Button click
-document.getElementById("clickButton").addEventListener("click", function() {
-    socket.emit('button_clicked', {data: 'clicked'});
+document.getElementById("f").addEventListener("click", function() {
+    socket.emit('button_clicked_01', {data: 'clicked'});
+});
+
+document.getElementById("b").addEventListener("click", function() {
+    socket.emit('button_clicked_02', {data: 'clicked'});
 });
 
 // Show message from Python

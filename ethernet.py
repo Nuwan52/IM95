@@ -2,15 +2,45 @@ import serial
 import struct
 import time
 import threading
+import queue
 
 
 class LeadshineServo:
-    def __init__(self, serial_conn, slave_id: int):
-        self.serial = serial_conn
-        self.slave_id = slave_id
-        self.lock = threading.Lock()  # protect serial port
+    def __init__(self, port='COM5', baudrate=38400, timeout=0.2):
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.serial = None
+        self.running = False
+        self.thread = None
+        self.cmd_queue = queue.Queue()
 
-    def calculate_crc(self, data: bytes) -> int:
+    def connect(self):
+        try:
+            self.serial = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_TWO,
+                timeout=self.timeout
+            )
+            print(f"Connected to {self.port} at {self.baudrate} baud")
+            return True
+        except Exception as e:
+            print(f"Failed to connect: {e}")
+            return False
+
+    def disconnect(self):
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join()
+        if self.serial and self.serial.is_open:
+            self.serial.close()
+            print("Disconnected")
+
+    # ========== Low-level helpers ==========
+    def calculate_crc(self, data: bytes):
         crc = 0xFFFF
         for byte in data:
             crc ^= byte
@@ -21,96 +51,158 @@ class LeadshineServo:
                     crc >>= 1
         return crc
 
-    def build_frame(self, function_code: int, address: int, data: bytes = b'') -> bytes:
-        frame = struct.pack('>BBH', self.slave_id, function_code, address) + data
+    def build_frame(self, function_code: int, address: int, data: bytes = b'', device_id=1):
+        frame = struct.pack('>B B H', device_id, function_code, address) + data
         crc = self.calculate_crc(frame)
-        frame += struct.pack('<H', crc)  # little endian
+        frame += struct.pack('<H', crc)
         return frame
 
-    def send_receive(self, frame: bytes, expected_len: int = 100) -> bytes:
-        with self.lock:
-            self.serial.reset_input_buffer()
-            self.serial.write(frame)
-            time.sleep(0.02)
-            response = self.serial.read(expected_len)
-            return response
+    def send_receive(self, frame: bytes, expected_len: int) -> bytes:
+        self.serial.reset_input_buffer()
+        self.serial.reset_output_buffer()
+        self.serial.write(frame)
+        print(f"Sent: {' '.join(f'{b:02X}' for b in frame)}")
 
-    def read_16bit_parameters(self, address: int, count: int = 1):
-        data = struct.pack('>H', count)
-        frame = self.build_frame(0x03, address, data)
-        response = self.send_receive(frame)
-        if len(response) >= 5 and response[0] == self.slave_id:
+        response = b''
+        start = time.time()
+        while len(response) < expected_len and (time.time() - start) < self.timeout:
+            chunk = self.serial.read(expected_len - len(response))
+            if chunk:
+                response += chunk
+
+        if len(response) < expected_len:
+            raise Exception(f"Incomplete response (got {len(response)}/{expected_len} bytes)")
+
+        print(f"Received: {' '.join(f'{b:02X}' for b in response)}")
+        return response
+
+    def write_16bit_parameter(self, address: int, value: int, device_id=1):
+        try:
+            data = struct.pack('>H', value)
+            frame = self.build_frame(0x06, address, data, device_id)
+            expected_len = 8
+            self.send_receive(frame, expected_len)
+            return True
+        except Exception as e:
+            print(f"Write error dev{device_id} @0x{address:04X}: {e}")
+            return False
+
+    def read_16bit_parameter(self, address: int, count=1, device_id=1):
+        try:
+            data = struct.pack('>H', count)
+            frame = self.build_frame(0x03, address, data, device_id)
+            expected_len = 5 + (count * 2)
+            response = self.send_receive(frame, expected_len)
             byte_count = response[2]
             values = []
             for i in range(0, byte_count, 2):
                 values.append(struct.unpack('>H', response[3 + i:5 + i])[0])
             return values
-        return []
+        except Exception as e:
+            print(f"Read error dev{device_id} @0x{address:04X}: {e}")
+            return []
 
-    def write_single_register(self, address: int, value: int):
-        data = struct.pack('>H', value)
-        frame = self.build_frame(0x06, address, data)
-        response = self.send_receive(frame)
-        return response
+    # ========== Servo control ==========
+    def enable_servo(self, device_id):
+        print(f"Enabling servo {device_id}")
+        return self.write_16bit_parameter(0x0409, 0x0083, device_id)
 
-    def move_absolute(self, target_pos: int, speed: int):
-        """Example: set speed then position register (adjust addresses per Leadshine manual)"""
-        # Write speed register (example address 0x2102)
-        self.write_single_register(0x2102, speed)
-        # Write target position register (example address 0x2103)
-        self.write_single_register(0x2103, target_pos)
-        # Start motion command (example: 0x2100 = 1)
-        self.write_single_register(0x2100, 1)
+    def disable_servo(self, device_id):
+        print(f"Disabling servo {device_id}")
+        # return self.write_16bit_parameter(0x0409, 0x0000, device_id)
 
+    def queue_move_absolute(self, device_id: int, position: int, velocity: int = 600):
+        """Queue a move (enable → write PR0 params → trigger → disable)"""
+        self.cmd_queue.put(("move", device_id, position, velocity))
 
-def feedback_loop(servos):
-    """Continuously read parameters from both motors"""
-    while True:
-        for servo in servos:
-            values = servo.read_16bit_parameters(0x6064, 1)  # position feedback
-            if values:
-                print(f"[ID {servo.slave_id}] Pos: {values[0]}")
-        time.sleep(0.1)
+    def _do_move_absolute(self, device_id: int, position: int, velocity: int):
+        print(f"Servo {device_id} -> Move {position} at {velocity}")
 
+        # Enable first
+        if not self.enable_servo(device_id):
+            return
 
-def main():
-    # One shared serial connection
-    ser = serial.Serial(
-        port='COM5',
-        baudrate=38400,
-        bytesize=serial.EIGHTBITS,
-        parity=serial.PARITY_NONE,
-        stopbits=serial.STOPBITS_TWO,
-        timeout=0.05
-    )
+        try:
+            # Step 1: set absolute mode
+            time.sleep(0.05)
+            if not self.write_16bit_parameter(0x6200, 0x0001, device_id):
+                print(f"Warning: failed to set absolute mode on servo {device_id}")
+            time.sleep(0.02)
 
-    # Two motors on same RS485 line
-    motor1 = LeadshineServo(ser, slave_id=1)
-    motor2 = LeadshineServo(ser, slave_id=2)
+            # Step 2: set position (32-bit split)
+            pos_high = (position >> 16) & 0xFFFF
+            pos_low = position & 0xFFFF
+            if not self.write_16bit_parameter(0x6201, pos_high, device_id):
+                print(f"Warning: failed to set pos_high on servo {device_id}")
+            time.sleep(0.02)
+            if not self.write_16bit_parameter(0x6202, pos_low, device_id):
+                print(f"Warning: failed to set pos_low on servo {device_id}")
+            time.sleep(0.02)
 
-    servos = [motor1, motor2]
+            # Step 3: velocity
+            if not self.write_16bit_parameter(0x6203, velocity, device_id):
+                print(f"Warning: failed to set velocity on servo {device_id}")
+            time.sleep(0.02)
 
-    # Start feedback reader thread
-    threading.Thread(target=feedback_loop, args=(servos,), daemon=True).start()
+            # Step 4: acceleration
+            self.write_16bit_parameter(0x6204, 0x0032, device_id)
+            time.sleep(0.02)
 
-    # Define positions & speeds
-    positions_motor1 = [1000, 2000, -1500, 500, 0]
-    speeds_motor1 = [200, 250, 300, 200, 150]
+            # Step 5: deceleration
+            self.write_16bit_parameter(0x6205, 0x0032, device_id)
+            time.sleep(0.02)
 
-    positions_motor2 = [500, 1500, -1000, 2000, 0]
-    speeds_motor2 = [150, 180, 220, 200, 150]
+            # Step 6: trigger motion
+            self.write_16bit_parameter(0x6002, 0x0010, device_id)
+            time.sleep(0.1)  # allow motion to start
 
-    print("Starting motion sequence...")
-    for i in range(len(positions_motor1)):
-        print(f"\n--- Step {i+1} ---")
-        motor1.move_absolute(positions_motor1[i], speeds_motor1[i])
-        motor2.move_absolute(positions_motor2[i], speeds_motor2[i])
+        finally:
+            # Always disable at the end
+            self.disable_servo(device_id)
 
-        # wait until motors reach positions (simplified)
-        time.sleep(2)
+    # ========== Worker thread ==========
+    def _worker(self):
+        while self.running:
+            # 1. Process queued commands
+            try:
+                cmd = self.cmd_queue.get_nowait()
+                if cmd[0] == "move":
+                    _, device_id, pos, vel = cmd
+                    self._do_move_absolute(device_id, pos, vel)
+            except queue.Empty:
+                pass
 
-    print("Sequence finished.")
+            # 2. Poll positions
+            for dev in [1, 2]:  # extend to 6 later
+                vals = self.read_16bit_parameter(0x0B09, 1, device_id=dev)
+                if vals:
+                    print(f"Servo {dev} position: {vals[0]}")
+                time.sleep(0.1)
+
+            time.sleep(0.2)
+
+    def start(self):
+        if not self.serial or not self.serial.is_open:
+            raise Exception("Connect before starting worker")
+        self.running = True
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
 
 
 if __name__ == "__main__":
-    main()
+    servo = LeadshineServo('COM5', 38400)
+    if servo.connect():
+        servo.start()
+
+        try:
+            # Queue two moves (thread handles them safely)
+            servo.queue_move_absolute(device_id=1, position=20000, velocity=1000)
+            servo.queue_move_absolute(device_id=2, position=-15000, velocity=1200)
+
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("Stopping...")
+        finally:
+            servo.disconnect()
